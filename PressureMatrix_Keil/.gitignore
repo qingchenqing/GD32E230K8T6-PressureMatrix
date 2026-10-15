@@ -1,0 +1,10 @@
+Keil/output/
+Keil/list/
+Keil/*.uvoptx
+Keil/*.uvguix.*
+tools/__pycache__/
+build/
+dist/
+Versions/**/*.exe
+Versions/**/*.axf
+Versions/**/*.hex
