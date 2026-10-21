@@ -40,6 +40,7 @@ static void update_display_frame(void)
 int main(void)
 {
     uint32_t next_packet_ms;
+    uint16_t packet_sequence = 0U;
     power_led_on();  /* PB1 拉低，指示灯先亮 500 ms */
     systick_config(); /* 配置 1 ms 节拍，供行切换后的稳定延时使用 */
     matrix_init();    /* 初始化 74HC595 行驱动和 8 路 ADC 输入 */
@@ -52,11 +53,8 @@ int main(void)
         ++g_matrix_frame_number;
         g_matrix_adc_errors = matrix_adc_error_count();
         if((int32_t)(systick_millis() - next_packet_ms) >= 0) {
-#if SERIAL_OUTPUT_MODE == 1U
-            serial_send_frame(g_matrix_frame, g_matrix_frame_number);
-#else
-            serial_send_frame(g_matrix_frame_255, g_matrix_frame_number);
-#endif
+            serial_send_frame(g_matrix_frame_255, packet_sequence);
+            packet_sequence = (uint16_t)(packet_sequence + 1U);
             next_packet_ms += 500U;
         }
     }

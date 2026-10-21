@@ -9,61 +9,21 @@ static void send_byte(uint8_t value)
     usart_data_transmit(USART0, value);
 }
 
-#if SERIAL_OUTPUT_MODE == 0U
-/* 不依赖 printf，逐位发送无符号十进制数。 */
-static void send_decimal(uint32_t value)
-{
-    uint8_t digits[10];
-    uint8_t count = 0U;
+/* Keil Watch 可直接查看这 155 个实际待发送字节。 */
+uint8_t g_serial_tx_packet[SERIAL_MATRIX_FRAME_LEN];
 
-    do {
-        digits[count++] = (uint8_t)(value % 10U);
-        value /= 10U;
-    } while(value != 0U);
-
-    while(count != 0U) {
-        send_byte((uint8_t)('0' + digits[--count]));
-    }
-}
-
-static void send_text(const char *text)
-{
-    while(*text != '\0') {
-        send_byte((uint8_t)*text++);
-    }
-}
-#elif SERIAL_OUTPUT_MODE == 1U
-/* 按小端序发送一个 16 位采样值，并把两个字节累加到校验和。 */
-static void send_u16(uint16_t value, uint16_t *sum)
-{
-    uint8_t low = (uint8_t)value;         /* 低 8 位，先发送 */
-    uint8_t high = (uint8_t)(value >> 8); /* 高 8 位，后发送 */
-    send_byte(low);
-    send_byte(high);
-    *sum = (uint16_t)(*sum + low + high);
-}
-#elif SERIAL_OUTPUT_MODE == 2U
-/* CRC-16/CCITT-FALSE：初值 FFFF，多项式 1021；从包类型算到无效位图。 */
-static uint16_t crc16_byte(uint16_t crc, uint8_t value)
+/* 文档规定 CRC8：初值 00，多项式 07，MSB-first，无反转或结果异或。 */
+static uint8_t crc8_byte(uint8_t crc, uint8_t value)
 {
     uint8_t bit;
 
-    crc ^= (uint16_t)value << 8;
+    crc ^= value;
     for(bit = 0U; bit < 8U; ++bit) {
-        crc = (crc & 0x8000U) ? (uint16_t)((crc << 1) ^ 0x1021U)
-                               : (uint16_t)(crc << 1);
+        crc = (crc & 0x80U) ? (uint8_t)((crc << 1) ^ 0x07U)
+                            : (uint8_t)(crc << 1);
     }
     return crc;
 }
-
-static void send_checked(uint8_t value, uint16_t *crc)
-{
-    send_byte(value);
-    *crc = crc16_byte(*crc, value);
-}
-#else
-#error Unsupported SERIAL_OUTPUT_MODE
-#endif
 
 /* 仅启用串口发送；接收端由 USB 转串口模块或其他主机提供。 */
 void serial_init(void)
@@ -83,87 +43,60 @@ void serial_init(void)
     usart_enable(USART0);
 }
 
-/* 模式 0：FRAME,帧号和 ROW01～ROW16 十进制文本。
-   模式 1：旧版 A5 5A | 帧号 | 128 个原始 ADC 值 | 累加校验。
-   模式 2：统一协议 5A A5 | 版本/INFO | CMD | SEQ | LEN | 148B DATA | CRC8。
-   值按行优先排列；每行一个无效位图字节，bit0～bit7 对应 COL1～COL8。 */
-void serial_send_frame(const uint16_t frame[MATRIX_ROWS][MATRIX_COLS], uint32_t frame_number)
+/* 固定文档协议：10 字节头 + 128 字节点值 + 16 字节保留零 + 1 字节 CRC8。
+   frame 已由 main.c 缩放为 0～255；序号与扫描帧数独立。 */
+void serial_send_frame(const uint16_t frame[MATRIX_ROWS][MATRIX_COLS], uint16_t sequence)
 {
-    uint8_t row;       /* 当前发送的行下标：0～15 */
-    uint8_t col;       /* 当前发送的列下标：0～7 */
-#if SERIAL_OUTPUT_MODE == 0U
-    send_text("FRAME,");
-    send_decimal(frame_number);
-    send_text("\r\n");
-    for(row = 0U; row < MATRIX_ROWS; ++row) {
-        send_text("ROW");
-        if(row < 9U) {
-            send_byte('0');
-        }
-        send_decimal((uint32_t)row + 1U);
-        for(col = 0U; col < MATRIX_COLS; ++col) {
-            send_byte(',');
-            send_decimal(frame[row][col]);
-        }
-        send_text("\r\n");
-    }
-    send_text("\r\n");
-#elif SERIAL_OUTPUT_MODE == 1U
-    uint16_t sum = 0U; /* 本帧的 16 位字节累加校验和 */
-    uint8_t i;         /* 帧号的字节下标：0～3 */
-
-    send_byte(0xA5U);
-    send_byte(0x5AU);
-    for(i = 0U; i < 4U; ++i) {
-        uint8_t data = (uint8_t)(frame_number >> (8U * i)); /* 当前帧号字节，低位先发 */
-        send_byte(data);
-        sum = (uint16_t)(sum + data);
-    }
-    for(row = 0U; row < MATRIX_ROWS; ++row) {
-        for(col = 0U; col < MATRIX_COLS; ++col) {
-            send_u16(frame[row][col], &sum);
-        }
-    }
-    send_byte((uint8_t)sum);
-    send_byte((uint8_t)(sum >> 8));
-#elif SERIAL_OUTPUT_MODE == 2U
-    uint8_t packet[155U];
-    uint8_t crc = 0U;
-    uint8_t i;
+    uint8_t row;
+    uint8_t col;
     uint8_t source_row;
-    uint16_t pos = 10U;
+    uint8_t crc = 0U;
+    uint16_t i;
+    uint16_t value;
+    uint8_t temporary;
 
-    packet[0] = 0x5AU;
-    packet[1] = 0xA5U;
-    packet[2] = 0x01U;
-    packet[3] = 0x10U;
-    packet[4] = 0x03U;
-    packet[5] = 0x02U;
-    packet[6] = (uint8_t)((frame_number - 1U) >> 8);
-    packet[7] = (uint8_t)(frame_number - 1U);
-    packet[8] = 0x00U;
-    packet[9] = 0x9BU;
+    g_serial_tx_packet[0] = 0x5AU;
+    g_serial_tx_packet[1] = 0xA5U;
+    g_serial_tx_packet[2] = 0x01U;
+    g_serial_tx_packet[3] = 0x10U;
+    g_serial_tx_packet[4] = 0x03U;
+    g_serial_tx_packet[5] = 0x02U;
+    g_serial_tx_packet[6] = (uint8_t)(sequence >> 8);
+    g_serial_tx_packet[7] = (uint8_t)sequence;
+    g_serial_tx_packet[8] = 0x00U;
+    g_serial_tx_packet[9] = 0x9BU;
+
+    /* 包行 Y7～Y0、Y8～Y15，每行依次 HC0～HC7。 */
     for(row = 0U; row < MATRIX_ROWS; ++row) {
         source_row = (row < 8U) ? (uint8_t)(7U - row) : row;
         for(col = 0U; col < MATRIX_COLS; ++col) {
-            uint16_t value = frame[source_row][col];
-            packet[pos++] = (value == MATRIX_ADC_INVALID) ? 0U : (uint8_t)value;
+            value = frame[source_row][col];
+            g_serial_tx_packet[10U + row * MATRIX_COLS + col] =
+                (value == MATRIX_ADC_INVALID) ? 0U : (uint8_t)value;
         }
     }
+    /* 全部 16 行分别反转每行的 8 个点，保持行的先后顺序。
+       例如点 1～8 -> 8～1，点 9～16 -> 16～9，依此类推。 */
     for(row = 0U; row < MATRIX_ROWS; ++row) {
-        packet[pos++] = 0U;
-    }
-    for(i = 0U; i < 154U; ++i) {
-        uint8_t bit;
-        crc ^= packet[i];
-        for(bit = 0U; bit < 8U; ++bit) {
-            crc = (crc & 0x80U) ? (uint8_t)((crc << 1) ^ 0x07U)
-                                 : (uint8_t)(crc << 1);
+        for(col = 0U; col < MATRIX_COLS / 2U; ++col) {
+            i = (uint16_t)(10U + row * MATRIX_COLS);
+            temporary = g_serial_tx_packet[i + col];
+            g_serial_tx_packet[i + col] = g_serial_tx_packet[i + MATRIX_COLS - 1U - col];
+            g_serial_tx_packet[i + MATRIX_COLS - 1U - col] = temporary;
         }
     }
-    packet[154] = crc;
-    for(i = 0U; i < 155U; ++i) {
-        send_byte(packet[i]);
+    /* 偏移 138～153 为保留区，全零，不存放超时位图。 */
+    for(i = 138U; i < 154U; ++i) {
+        g_serial_tx_packet[i] = 0U;
     }
-#endif
+    /* 偏移 0～153 全部参与 CRC8，包含 5A A5 帧头。 */
+    for(i = 0U; i < 154U; ++i) {
+        crc = crc8_byte(crc, g_serial_tx_packet[i]);
+    }
+    g_serial_tx_packet[154] = crc;
+
+    /* 仅发送这 155 个二进制字节，不添加文本、换行或终止符。 */
+    for(i = 0U; i < SERIAL_MATRIX_FRAME_LEN; ++i) {
+        send_byte(g_serial_tx_packet[i]);
+    }
 }

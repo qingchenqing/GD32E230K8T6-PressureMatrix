@@ -4,11 +4,13 @@
 #include <stdint.h>
 #include "matrix.h"
 
-/* 0：十进制文本；1：旧版 12 位原始值二进制帧；2：统一通信协议矩阵包。 */
-#define SERIAL_OUTPUT_MODE 2U
+#define SERIAL_MATRIX_FRAME_LEN 155U
 
-void serial_init(void); /* 配置 PA9 / USART0，115200、8N1 */
-/* 模式 0/2 传入 0～255 显示帧，模式 1 传入 12 位原始帧；模式 2 每 500 ms 调用一次。 */
-void serial_send_frame(const uint16_t frame[MATRIX_ROWS][MATRIX_COLS], uint32_t frame_number);
+/* 实际发送缓冲区，供 Keil Watch 核对。 */
+extern uint8_t g_serial_tx_packet[SERIAL_MATRIX_FRAME_LEN];
+
+void serial_init(void); /* PA9 / USART0，115200、8N1 */
+/* 0～255 显示帧，独立 16 位发送流水号；固定 155 字节 CRC8 协议。 */
+void serial_send_frame(const uint16_t frame[MATRIX_ROWS][MATRIX_COLS], uint16_t sequence);
 
 #endif

@@ -70,45 +70,40 @@ def read_frame(port):
 
 
 def read_packed_frame(port):
-    """Read the current 5A A5 / 159-byte / CRC8 matrix protocol.
+    """Read a 155-byte CRC8 matrix report and restore scan row order.
 
-    The firmware sends rows Y7..Y0 followed by Y8..Y15; this function
-    restores physical row-major order for the GUI.
+    Wire rows are Y7..Y0, Y8..Y15; current firmware sends HC7..HC0.
+    Column order is returned as received so the transmitted reversal remains visible.
+    Offsets 138..153 are reserved zeros, not invalid-point masks.
     """
-    previous = 0
+    buffer = bytearray()
     while True:
-        current = port.read(1)
-        if not current:
+        chunk = port.read(1)
+        if not chunk:
             continue
-        value = current[0]
-        if previous == 0x5A and value == 0xA5:
-            header = read_exact(port, 8)
-            if len(header) != 8 or header[0] != 0x01 or header[1] != 0x10:
-                previous = header[-1] if header else 0
+        buffer.extend(chunk)
+        while len(buffer) >= 2:
+            if buffer[:2] != b"\x5a\xa5":
+                del buffer[0]
                 continue
-            command = struct.unpack_from(">H", header, 2)[0]
-            frame_length = struct.unpack_from(">H", header, 6)[0]
-            if command != 0x0302 or frame_length != 11 + PACKET_DATA_BYTES:
-                previous = header[-1]
+            if len(buffer) < 10:
+                break
+            if (buffer[2:6] != b"\x01\x10\x03\x02" or
+                    struct.unpack_from(">H", buffer, 8)[0] != 155):
+                del buffer[0]
                 continue
-            data_and_crc = read_exact(port, frame_length - 10)
-            packet = bytes((0x5A, 0xA5)) + header + data_and_crc
-            if crc8(packet[:-1]) != packet[-1]:
-                previous = packet[-1]
+            if len(buffer) < 155:
+                break
+            if crc8(buffer[:154]) != buffer[154] or buffer[138:154] != bytes(16):
+                del buffer[0]
                 continue
-            data = packet[10:-1]
-            sequence = struct.unpack_from(">H", header, 4)[0]
-            packet_values = data[:128]
-            packet_invalid = data[128:144]
+            sequence = struct.unpack_from(">H", buffer, 6)[0]
             values = [0] * 128
-            for packet_index, value8 in enumerate(packet_values):
-                packet_row, col = divmod(packet_index, 8)
+            for packet_row in range(16):
                 source_row = 7 - packet_row if packet_row < 8 else packet_row
-                values[source_row * 8 + col] = value8
-                if packet_invalid[packet_index // 8] & (1 << (packet_index % 8)):
-                    values[source_row * 8 + col] = 65535
+                values[source_row * 8:source_row * 8 + 8] = buffer[
+                    10 + packet_row * 8:18 + packet_row * 8]
             return sequence, values
-        previous = value
 
 
 def main():
@@ -153,7 +148,8 @@ def main():
                 if not should_display(received):
                     continue
                 scale = "0..255" if packed else "raw ADC, 0..4095"
-                print(f"\nframe {sequence}  ({scale}; 65535=timeout)")
+                status = "timeout sends 0; 16 reserved zeros" if packed else "65535=timeout"
+                print(f"\nframe {sequence}  ({scale}; {status})")
                 print("        COL1 COL2 COL3 COL4 COL5 COL6 COL7 COL8")
                 for row in range(16):
                     source_row = source_row_for_display(row)
