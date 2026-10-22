@@ -450,6 +450,11 @@
               <FilePath>..\Vendor\GD32E23x_standard_peripheral\Source\gd32e23x_adc.c</FilePath>
             </File>
             <File>
+              <FileName>gd32e23x_fwdgt.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Vendor\GD32E23x_standard_peripheral\Source\gd32e23x_fwdgt.c</FilePath>
+            </File>
+            <File>
               <FileName>gd32e23x_gpio.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Vendor\GD32E23x_standard_peripheral\Source\gd32e23x_gpio.c</FilePath>

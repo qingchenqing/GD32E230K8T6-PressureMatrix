@@ -80,12 +80,17 @@ class DocumentProtocolTests(unittest.TestCase):
         wire = [values[row * 8 + col] for row in ROWS for col in range(8)]
         wire = [v for start in range(0, 128, 8)
                 for v in wire[start:start + 8][::-1]]
+        wire[64:] = wire[64:][::-1]
+        wire[64:] = [v for start in range(64, 128, 8)
+                     for v in wire[start:start + 8][::-1]]
         for sequence in (0, 1, 0x1234, 0xFFFF):
             packet = send_frame(values, sequence)
             self.assertEqual(len(packet), 155)
             self.assertEqual(packet, expected_packet(wire, sequence))
             self.assertEqual(monitor.read_packed_frame(io.BytesIO(packet)),
-                             (sequence, [v for start in range(0, 128, 8)
+                             (sequence, [v for start in range(0, 64, 8)
+                                         for v in values[start:start + 8][::-1]] +
+                                        [v for start in range(120, 63, -8)
                                          for v in values[start:start + 8][::-1]]))
 
     def test_timeouts_keep_reserved_bytes_zero(self):
@@ -94,6 +99,9 @@ class DocumentProtocolTests(unittest.TestCase):
                     for row in ROWS for col in range(8)]
             wire = [v for start in range(0, 128, 8)
                     for v in wire[start:start + 8][::-1]]
+            wire[64:] = wire[64:][::-1]
+            wire[64:] = [v for start in range(64, 128, 8)
+                         for v in wire[start:start + 8][::-1]]
             self.assertEqual(send_frame(values, 0), expected_packet(wire))
 
     def test_user_captured_packet(self):
@@ -117,9 +125,13 @@ class DocumentProtocolTests(unittest.TestCase):
         actual = send_frame(raw, 0x003C)
         self.assertEqual(len(actual), 155)
         self.assertEqual(actual[:10], original[:10])
-        for row in range(16):
+        for row in range(8):
             start = 10 + row * 8
             self.assertEqual(actual[start:start + 8], original[start:start + 8][::-1])
+        for row in range(8):
+            start = 74 + row * 8
+            source = 130 - row * 8
+            self.assertEqual(actual[start:start + 8], original[source:source + 8][::-1])
         self.assertEqual(actual[138:154], original[138:154])
         self.assertEqual(actual[154], monitor.crc8(actual[:154]))
 

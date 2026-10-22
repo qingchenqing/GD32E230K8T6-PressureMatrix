@@ -72,7 +72,8 @@ def read_frame(port):
 def read_packed_frame(port):
     """Read a 155-byte CRC8 matrix report and restore scan row order.
 
-    Wire rows are Y7..Y0, Y8..Y15; current firmware sends HC7..HC0.
+    Current wire rows: Y7..Y0, then Y15..Y8; all rows use HC7..HC0.
+    The original row mapping below is retained so the requested reorder is visible.
     Column order is returned as received so the transmitted reversal remains visible.
     Offsets 138..153 are reserved zeros, not invalid-point masks.
     """

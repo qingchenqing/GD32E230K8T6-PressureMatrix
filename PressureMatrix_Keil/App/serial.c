@@ -85,6 +85,23 @@ void serial_send_frame(const uint16_t frame[MATRIX_ROWS][MATRIX_COLS], uint16_t 
             g_serial_tx_packet[i + MATRIX_COLS - 1U - col] = temporary;
         }
     }
+    /* 保留上述逐行倒序，再整体反转后 64 点（整帧偏移 74～137）。
+       此步骤后，后 8 行反转行序、恢复原列序。 */
+    for(i = 0U; i < 32U; ++i) {
+        temporary = g_serial_tx_packet[74U + i];
+        g_serial_tx_packet[74U + i] = g_serial_tx_packet[137U - i];
+        g_serial_tx_packet[137U - i] = temporary;
+    }
+    /* 最新要求：在当前结果上，仅将后 8 行各自的 8 个点再次倒序。
+       前 64 点保持当前顺序，后 8 行的行序保持上一步结果。 */
+    for(row = 8U; row < MATRIX_ROWS; ++row) {
+        i = (uint16_t)(10U + row * MATRIX_COLS);
+        for(col = 0U; col < MATRIX_COLS / 2U; ++col) {
+            temporary = g_serial_tx_packet[i + col];
+            g_serial_tx_packet[i + col] = g_serial_tx_packet[i + MATRIX_COLS - 1U - col];
+            g_serial_tx_packet[i + MATRIX_COLS - 1U - col] = temporary;
+        }
+    }
     /* 偏移 138～153 为保留区，全零，不存放超时位图。 */
     for(i = 138U; i < 154U; ++i) {
         g_serial_tx_packet[i] = 0U;

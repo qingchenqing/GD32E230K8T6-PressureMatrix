@@ -6,6 +6,20 @@
 
 #define POWER_LED_PIN GPIO_PIN_1 /* PB1：上电指示灯，低电平点亮 */
 
+/* IRC32K 标称 32 kHz：128 * (499 + 1) / 32000 = 2 s。
+   实际超时时间随内部低速振荡器频率偏差变化。 */
+#define WATCHDOG_RELOAD 499U
+
+static void watchdog_init(void)
+{
+    /* fwdgt_config 内部启动独立看门狗，并配置分频、重装值及首次喂狗。 */
+    if(SUCCESS != fwdgt_config(WATCHDOG_RELOAD, FWDGT_PSC_DIV128)) {
+        /* 配置失败时停止执行，等待已启动的看门狗复位。 */
+        for(;;) {
+        }
+    }
+}
+
 /* 在应用初始化开始时点亮指示灯；后续由 SysTick 每 500 ms 翻转一次。 */
 static void power_led_on(void)
 {
@@ -42,6 +56,7 @@ int main(void)
     uint32_t next_packet_ms;
     uint16_t packet_sequence = 0U;
     power_led_on();  /* PB1 拉低，指示灯先亮 500 ms */
+    watchdog_init(); /* 在外设初始化前启动，覆盖 ADC 校准等阻塞等待 */
     systick_config(); /* 配置 1 ms 节拍，供行切换后的稳定延时使用 */
     matrix_init();    /* 初始化 74HC595 行驱动和 8 路 ADC 输入 */
     serial_init();    /* 初始化 PA9 上的 USART0 发送功能 */
@@ -57,5 +72,7 @@ int main(void)
             packet_sequence = (uint16_t)(packet_sequence + 1U);
             next_packet_ms += 500U;
         }
+        /* 仅在本轮扫描及可能的串口发送完成后喂狗；中断内不喂狗。 */
+        fwdgt_counter_reload();
     }
 }
