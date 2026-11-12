@@ -1,7 +1,8 @@
 ﻿/*
  * 报警初版调试  2026-11-12
- * PB1 检测 D19 前的 5 V，PA11 输出报警命令，PA12 使能 Q17。
- * 空闲时 PB0 绿灯常亮，中级 PA8 黄灯约 0.6 Hz，高级 PB6 红灯 2 Hz。
+ * PB1 检测 D19 前的 5 V，PA11 输出报警命令，PA12 双击确认报警。
+ * 断电声光限时 60 秒，双击可提前结束。正常供电时双击后等待 20 秒再复核。
+ * 空闲时 PA8 绿灯常亮，中级 PB0 黄灯约 0.6 Hz，高级 PB6 红灯 2 Hz。
  * 断电后优先高级报警，暂停矩阵与 USART0，间歇检查电源。
  * 串口协议及异常中止行为见 serial.h。
  */
@@ -72,6 +73,7 @@ static void power_sleep_ms(uint32_t duration)
 {
     uint32_t start = systick_millis();
     while((uint32_t)(systick_millis() - start) < duration) {
+        serial_service_alarm(); /* 断电休眠间隙仍处理双击和报警复核。 */
         __DSB();
         __WFI(); /* SysTick 唤醒 CPU，继续推进红灯和毫秒计数。 */
     }
@@ -179,6 +181,7 @@ int main(void)
         }
 
         serial_process_commands();
+        serial_service_alarm();
         if(!matrix_scan_frame(g_matrix_frame) || !power_supply_ok()) {
             continue;
         }

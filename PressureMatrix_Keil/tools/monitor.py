@@ -69,13 +69,14 @@ def read_frame(port):
         previous = value
 
 
-def read_packed_frame(port):
+def read_packed_frame(port, *, include_button=False):
     """Read a 155-byte CRC8 matrix report and restore scan row order.
 
     Current wire rows: Y7..Y0, then Y15..Y8; all rows use HC7..HC0.
     The original row mapping below is retained so the requested reorder is visible.
     Column order is returned as received so the transmitted reversal remains visible.
-    Offsets 138..153 are reserved zeros, not invalid-point masks.
+    Offset 138 is the button state (0 released, 1 pressed); 139..153 are zero.
+    With include_button=True, return (sequence, values, button).
     """
     buffer = bytearray()
     while True:
@@ -95,7 +96,8 @@ def read_packed_frame(port):
                 continue
             if len(buffer) < 155:
                 break
-            if crc8(buffer[:154]) != buffer[154] or buffer[138:154] != bytes(16):
+            if (crc8(buffer[:154]) != buffer[154] or
+                    buffer[138] not in (0, 1) or buffer[139:154] != bytes(15)):
                 del buffer[0]
                 continue
             sequence = struct.unpack_from(">H", buffer, 6)[0]
@@ -104,6 +106,8 @@ def read_packed_frame(port):
                 source_row = 7 - packet_row if packet_row < 8 else packet_row
                 values[source_row * 8:source_row * 8 + 8] = buffer[
                     10 + packet_row * 8:18 + packet_row * 8]
+            if include_button:
+                return sequence, values, buffer[138]
             return sequence, values
 
 
@@ -144,12 +148,15 @@ def main():
         if args.binary or not args.text:
             packed = not args.binary
             while True:
-                sequence, values = (read_packed_frame(port) if packed else read_frame(port))
+                if packed:
+                    sequence, values, button = read_packed_frame(port, include_button=True)
+                else:
+                    sequence, values = read_frame(port)
                 received += 1
                 if not should_display(received):
                     continue
                 scale = "0..255" if packed else "raw ADC, 0..4095"
-                status = "timeout sends 0; 16 reserved zeros" if packed else "65535=timeout"
+                status = f"timeout sends 0; button={button:02X}" if packed else "65535=timeout"
                 print(f"\nframe {sequence}  ({scale}; {status})")
                 print("        COL1 COL2 COL3 COL4 COL5 COL6 COL7 COL8")
                 for row in range(16):

@@ -46,8 +46,9 @@ def emulator():
     return cpu, symbols
 
 
-def send_frame(values, sequence):
+def send_frame(values, sequence, *, button=0):
     cpu, symbols = emulator()
+    cpu.mem_write(symbols['alarm_key_pressed'], bytes([button]))
     raw = struct.pack('<128H', *values)
     cpu.mem_write(0x20001000, raw)
     cpu.reg_write(UC_ARM_REG_R0, 0x20001000)
@@ -98,6 +99,19 @@ class DocumentProtocolTests(unittest.TestCase):
                                          for v in values[start:start + 8][::-1]] +
                                         [v for start in range(120, 63, -8)
                                          for v in values[start:start + 8][::-1]]))
+
+    def test_button_byte_and_crc(self):
+        released = send_frame([0] * 128, 7)
+        pressed = send_frame([0] * 128, 7, button=1)
+        self.assertEqual(released[:138], pressed[:138])
+        self.assertEqual(released[138:154], bytes(16))
+        self.assertEqual(pressed[138:154], bytes([1]) + bytes(15))
+        self.assertEqual(pressed[154], monitor.crc8(pressed[:154]))
+        self.assertNotEqual(pressed[154], released[154])
+        self.assertEqual(monitor.read_packed_frame(io.BytesIO(pressed)), (7, [0] * 128))
+        for packet, expected in ((released, 0), (pressed, 1)):
+            self.assertEqual(monitor.read_packed_frame(io.BytesIO(packet), include_button=True),
+                             (7, [0] * 128, expected))
 
     def test_timeouts_keep_reserved_bytes_zero(self):
         for values in ([65535] * 128, [0, 255, 65535, 128] * 32):
@@ -152,10 +166,12 @@ class DocumentProtocolTests(unittest.TestCase):
             bad[index] ^= 1
             self.assertEqual(monitor.read_packed_frame(io.BytesIO(
                 b'noise\x5a' + bad + good)), expected)
-        bad = bytearray(good)
-        bad[138] = 1
-        bad[154] = monitor.crc8(bad[:154])
-        self.assertEqual(monitor.read_packed_frame(io.BytesIO(bad + good)), expected)
+        for index, invalid in ((138, 2), (139, 1)):
+            bad = bytearray(good)
+            bad[6:8] = bytes(2)  # Distinguish the rejected frame from the following good one.
+            bad[index] = invalid
+            bad[154] = monitor.crc8(bad[:154])
+            self.assertEqual(monitor.read_packed_frame(io.BytesIO(bad + good)), expected)
 
     def test_main_sequences_count_packets_instead_of_scans(self):
         cpu, symbols = emulator()
