@@ -1,13 +1,7 @@
-#include "serial.h"
+﻿#include "serial.h"
+#include "power.h"
 #include "gd32e23x.h"
-
-/* USART0 TX 经 PA9 接到原理图的 U0_TX，电平为 3.3 V TTL，格式为 115200 8N1。 */
-static void send_byte(uint8_t value)
-{
-    while(RESET == usart_flag_get(USART0, USART_FLAG_TBE)) {
-    }
-    usart_data_transmit(USART0, value);
-}
+#include "systick.h"
 
 /* Keil Watch 可直接查看这 155 个实际待发送字节。 */
 uint8_t g_serial_tx_packet[SERIAL_MATRIX_FRAME_LEN];
@@ -25,27 +19,304 @@ static uint8_t crc8_byte(uint8_t crc, uint8_t value)
     return crc;
 }
 
-/* 仅启用串口发送；接收端由 USB 转串口模块或其他主机提供。 */
+/* 接收数据流：PA10 -> USART0_IRQHandler() -> rx_buf -> serial_process_commands()。
+   中断只收数据，主循环再执行报警，避免在串口中断中阻塞输出波形。
+   发送压力帧走 PA9，与 PA10 接收共用 USART0，串口参数均为 115200、8N1。 */
+
+/* 64 字节环形缓冲区：rx_head 指向下次写入位置，rx_tail 指向下次读取位置。
+   head == tail 表示空；保留一个空位区分满/空，所以最多排队 63 字节。
+   中断写 head，主循环写 tail；volatile 使编译器每次读取实际共享变量。 */
+static volatile uint8_t rx_buf[64], rx_head, rx_tail;
+/* Watch 调试：收到的字节总数；缓冲满丢弃次数与硬件溢出事件的合计。
+   g_serial_rx_dropped 是事件计数，不能精确表示硬件溢出时丢了多少字节。 */
+volatile uint32_t g_serial_rx_count, g_serial_rx_dropped;
+volatile uint8_t g_serial_rx_last; /* 最近收到的字节；HEX 发送 03 时应看到 0x03。 */
+
+/* USART0 接收中断入口，名称与启动文件的中断向量一致。
+   RBNE：接收数据寄存器非空；ORERR：上个字节未及时读取，又收到新字节。 */
+void USART0_IRQHandler(void)
+{
+    uint32_t status = USART_STAT(USART0); /* 先读状态，随后读取接收数据。 */
+    if(status & (USART_STAT_RBNE | USART_STAT_ORERR)) {
+        uint8_t value = (uint8_t)usart_data_receive(USART0);
+        if(status & USART_STAT_ORERR) ++g_serial_rx_dropped;
+        if(status & USART_STAT_RBNE) {
+            /* 与 63 相与，实现 0～63 循环；此写法依赖缓冲长度为 64。 */
+            uint8_t next = (uint8_t)((rx_head + 1U) & 63U);
+            g_serial_rx_last = value;
+            ++g_serial_rx_count;
+            /* 先存数据，再更新写指针；满时保留已排队数据，丢弃新字节。 */
+            if(next != rx_tail) { rx_buf[rx_head] = value; rx_head = next; }
+            else ++g_serial_rx_dropped;
+        }
+    }
+}
+
+/* 使用 SysTick 递减计数器等待微秒，不修改原来的 1 ms 系统节拍。
+   必须先调用 systick_config()；处理计数器从 0 重装 LOAD 的回绕。
+   中断保持开启，因此实际波形时间仍需示波器验证。 */
+static void alarm_wait_us(uint32_t us)
+{
+    uint32_t left = (SystemCoreClock / 1000000U) * us; /* 等待的核心时钟周期数。 */
+    uint32_t prev = SysTick->VAL;
+    while(left) {
+        uint32_t now = SysTick->VAL;
+        uint32_t elapsed = prev >= now ? prev - now : prev + SysTick->LOAD + 1U - now;
+        if(elapsed >= left) break;
+        left -= elapsed;
+        prev = now;
+    }
+}
+
+/* YY0709 底层控制：cmd 为 PA11 输出的上升沿个数，不是串口发送函数。
+   0 停止；1 BEEP；2 低级一次；3 中级持续；4 高级持续；5 高音量。
+   先低电平清除状态，可从高级切回低级；非零命令最后保持高电平。 */
+static void alarm_send_raw(uint8_t cmd)
+{
+    uint8_t i;
+    gpio_bit_reset(GPIOA, GPIO_PIN_11);
+    alarm_wait_us(500U); /* 低电平至少 400 us：停止声音并清除报警状态。 */
+    for(i = 0U; i < cmd; ++i) {
+        gpio_bit_set(GPIOA, GPIO_PIN_11); /* 产生一个上升沿。 */
+        if(i + 1U < cmd) {
+            /* 中间脉冲高、低各约 100 us，位于模块要求的 30～300 us 内。 */
+            alarm_wait_us(100U);
+            gpio_bit_reset(GPIOA, GPIO_PIN_11);
+            alarm_wait_us(100U);
+        }
+    }
+    if(cmd) alarm_wait_us(700U); /* 最后一段高电平至少 600 us，完成命令接收。 */
+}
+
+/* 板载灯和 MOS 均为高电平有效。PA8 在原理图标为 LEDB，用作中级报警灯。 */
+#define ALARM_ENABLE_PIN GPIO_PIN_12
+#define ALARM_YELLOW_PIN GPIO_PIN_8
+#define ALARM_RED_PIN GPIO_PIN_6
+#define ALARM_GREEN_PIN GPIO_PIN_0
+#define ALARM_MODULE_STARTUP_MS 200U
+#define ALARM_ONE_SHOT_LED_MS 200U /* 单次声音的灯态窗口，模块自行结束声音。 */
+#define ALARM_YELLOW_HALF_MS 833U  /* 约 0.6 Hz，亮灭各 833 ms。 */
+#define ALARM_RED_HALF_MS 250U     /* 2 Hz，亮灭各 250 ms。 */
+
+/* 主循环选择灯状态，SysTick 负责闪烁和单次提示后的绿灯恢复。 */
+static volatile uint8_t alarm_led_command;
+static volatile uint16_t alarm_led_elapsed_ms;
+static uint8_t power_failure_active; /* 仅主循环访问。 */
+
+void serial_alarm_led_tick(void)
+{
+    uint8_t command = alarm_led_command;
+
+    if(command == 1U || command == 2U) {
+        if(++alarm_led_elapsed_ms >= ALARM_ONE_SHOT_LED_MS) {
+            alarm_led_elapsed_ms = 0U;
+            alarm_led_command = 0U;
+            gpio_bit_set(GPIOB, ALARM_GREEN_PIN);
+        }
+    } else if(command == 3U) {
+        if(++alarm_led_elapsed_ms >= ALARM_YELLOW_HALF_MS) {
+            alarm_led_elapsed_ms = 0U;
+            gpio_bit_toggle(GPIOA, ALARM_YELLOW_PIN);
+        }
+    } else if(command == 4U) {
+        if(++alarm_led_elapsed_ms >= ALARM_RED_HALF_MS) {
+            alarm_led_elapsed_ms = 0U;
+            gpio_bit_toggle(GPIOB, ALARM_RED_PIN);
+        }
+    }
+}
+
+static void alarm_led_stop(void)
+{
+    /* 先让 SysTick 停止翻转，再清零计时和两路输出。 */
+    alarm_led_command = 0U;
+    alarm_led_elapsed_ms = 0U;
+    gpio_bit_reset(GPIOA, ALARM_YELLOW_PIN);
+    gpio_bit_reset(GPIOB, ALARM_RED_PIN);
+}
+
+static void alarm_module_enable(void)
+{
+    if(RESET == gpio_output_bit_get(GPIOA, ALARM_ENABLE_PIN)) {
+        gpio_bit_reset(GPIOA, GPIO_PIN_11);
+        gpio_bit_set(GPIOA, ALARM_ENABLE_PIN);
+        /* Q17 接通模块地后，等待模块初始化再发 PA11 脉冲。 */
+        delay_1ms(ALARM_MODULE_STARTUP_MS);
+    }
+}
+
+/* 有效命令先结束旧灯状态。非零命令在模块使能后发送。 */
+static void alarm_command(uint8_t cmd)
+{
+    alarm_led_stop();
+    if(cmd == 0U) {
+        /* PA11 持续拉低停止声音，保持 PA12 当前状态，避免停响时切断模块地。 */
+        alarm_send_raw(0U);
+        gpio_bit_set(GPIOB, ALARM_GREEN_PIN);
+        return;
+    }
+
+    if(cmd <= 4U) {
+        gpio_bit_reset(GPIOB, ALARM_GREEN_PIN);
+    }
+    alarm_module_enable();
+    if(cmd <= 4U) {
+        alarm_send_raw(5U); /* 所有声音保持高音量。 */
+    } else if(cmd == 6U || cmd == 7U) {
+        cmd = 5U;
+    }
+    alarm_send_raw(cmd);
+
+    /* 中高级报警灯从点亮开始，单次报警由节拍计时恢复绿灯。 */
+    if(cmd == 3U) {
+        gpio_bit_set(GPIOA, ALARM_YELLOW_PIN);
+    } else if(cmd == 4U) {
+        gpio_bit_set(GPIOB, ALARM_RED_PIN);
+    }
+    if(cmd <= 4U) {
+        alarm_led_command = cmd;
+    } else {
+        /* 设置音量会清除旧报警，恢复空闲绿灯。 */
+        gpio_bit_set(GPIOB, ALARM_GREEN_PIN);
+    }
+}
+
+/* 断电使用现有的高级声光报警，恢复供电后停止并恢复绿灯。 */
+void serial_set_power_failure(uint8_t active)
+{
+    power_failure_active = active;
+    rx_tail = rx_head;
+    alarm_command(active ? 4U : 0U);
+}
+
+/* 主循环每次调用最多处理一个字节，不在这里等待新数据。
+   调试协议为单字节 HEX：00 停止，01 BEEP，02 低级，03 中级，04 高级，
+   05～07 均设高音量；08～FF 忽略。无帧头、校验、回车换行或 ACK。
+   注意：HEX 发送 03 才是 0x03；文本发送“03”会得到 0x30、0x33，均忽略。
+   03、04 持续发声，需要另发 00 停止；连续发 03 00 可能很快停止听不到。 */
+void serial_process_commands(void)
+{
+    /* 断电报警期间丢弃串口命令，避免 00 或其他等级覆盖高级报警。 */
+    if(power_failure_active) {
+        rx_tail = rx_head;
+        return;
+    }
+    if(rx_head != rx_tail) { /* 读写指针不同，说明有待处理的数据。 */
+        uint8_t cmd = rx_buf[rx_tail];
+        rx_tail = (uint8_t)((rx_tail + 1U) & 63U); /* 取出后立即释放该位置。 */
+        if(cmd <= 7U) alarm_command(cmd);
+    }
+}
+
+/* 上电提示：BEEP -> 中级 -> 高级，全部高音量，最后 PA11 拉低停止。
+   每种声音窗口 200 ms，中间静音 200 ms；中高级为持续命令，靠停止截断。
+   200 ms 不保证恰好一个完整报警周期，具体听感需在 YY0709 模块上确认。
+   本函数在初始化后阻塞执行一次，期间串口仍接收缓存，主循环尚未处理命令。 */
+/* 上电播放过程中同样检查断电，提前结束提示后由主循环接管。 */
+static uint8_t startup_wait(uint32_t duration)
+{
+    uint32_t start = systick_millis();
+    while((uint32_t)(systick_millis() - start) < duration) {
+        if(!power_supply_ok()) {
+            return 0U;
+        }
+        __WFI();
+    }
+    return power_supply_ok();
+}
+
+void serial_startup_beep(void)
+{
+    static const uint8_t commands[] = {1U, 3U, 4U};
+    uint8_t i;
+
+    fwdgt_counter_reload();
+    alarm_module_enable(); /* 上电提示开始前先接通模块。 */
+    for(i = 0U; i < sizeof(commands) / sizeof(commands[0]); ++i) {//i 是否小于数组的元素个数。
+        if(!power_supply_ok()) {
+            return;
+        }
+        alarm_command(commands[i]);
+        if(!startup_wait(200U)) {
+            return;
+        }
+        alarm_led_stop();
+        alarm_send_raw(0U); /* 段间静音，模块保持使能。 */
+        gpio_bit_set(GPIOB, ALARM_GREEN_PIN);
+        /* 仅在本段上电提示执行完成后喂狗，不在中断中喂狗。 */
+        fwdgt_counter_reload();
+        if(i + 1U < sizeof(commands) / sizeof(commands[0]) && !startup_wait(200U)) {
+            return;
+        }
+    }
+}
+
+/* 初始化 PA9 TX、PA10 RX、报警模块使能及三路状态灯。
+   外部串口模块 TX 接 PA10，RX 接 PA9，并与单片机共地，使用 3.3 V TTL。 */
 void serial_init(void)
 {
-    rcu_periph_clock_enable(RCU_GPIOA);
+    rcu_periph_clock_enable(RCU_GPIOA); /* GPIO 配置前先使能端口时钟。 */
+    /* PA11 波形、PA12 使能、PA8 黄灯、PB6 红灯都先预置低电平。 */
+    rcu_periph_clock_enable(RCU_GPIOB);
+    gpio_bit_reset(GPIOA, GPIO_PIN_11 | ALARM_ENABLE_PIN | ALARM_YELLOW_PIN);
+    gpio_bit_reset(GPIOB, ALARM_RED_PIN);
+    gpio_mode_set(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE,
+                  GPIO_PIN_11 | ALARM_ENABLE_PIN | ALARM_YELLOW_PIN);
+    gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_10MHZ,
+                            GPIO_PIN_11 | ALARM_ENABLE_PIN | ALARM_YELLOW_PIN);
+    /* PB0 在原理图为 LEDG，空闲时预置高电平。 */
+    gpio_bit_set(GPIOB, ALARM_GREEN_PIN);
+    gpio_mode_set(GPIOB, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, ALARM_RED_PIN | ALARM_GREEN_PIN);
+    gpio_output_options_set(GPIOB, GPIO_OTYPE_PP, GPIO_OSPEED_10MHZ,
+                            ALARM_RED_PIN | ALARM_GREEN_PIN);
+    serial_resume();
+}
+
+void serial_suspend(void)
+{
+    NVIC_DisableIRQ(USART0_IRQn);
+    usart_interrupt_disable(USART0, USART_INT_RBNE);
+    usart_disable(USART0);
+    rcu_periph_clock_disable(RCU_USART0);
+    NVIC_ClearPendingIRQ(USART0_IRQn);
+    rx_tail = rx_head;
+
+    /* TX 保持空闲高电平，RX 禁用数字输入，关闭串口唤醒源。 */
+    gpio_bit_set(GPIOA, GPIO_PIN_9);
+    gpio_mode_set(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO_PIN_9);
+    gpio_mode_set(GPIOA, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO_PIN_10);
+}
+
+void serial_resume(void)
+{
     rcu_periph_clock_enable(RCU_USART0);
+    /* PA9 选择 AF1 复用为 USART0_TX，推挽输出。 */
     gpio_af_set(GPIOA, GPIO_AF_1, GPIO_PIN_9);
     gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_PULLUP, GPIO_PIN_9);
     gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_10MHZ, GPIO_PIN_9);
 
+    /* PA10 选择 AF1 复用为 USART0_RX，上拉保持空闲高电平。 */
+    gpio_af_set(GPIOA, GPIO_AF_1, GPIO_PIN_10);
+    gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_PULLUP, GPIO_PIN_10);
     usart_deinit(USART0);
+    /* 115200、8N1：8 位数据、1 位停止位、无校验。 */
     usart_word_length_set(USART0, USART_WL_8BIT);
     usart_stop_bit_set(USART0, USART_STB_1BIT);
     usart_parity_config(USART0, USART_PM_NONE);
     usart_baudrate_set(USART0, 115200U);
-    usart_transmit_config(USART0, USART_TRANSMIT_ENABLE);
+    usart_transmit_config(USART0, USART_TRANSMIT_ENABLE); /* 开启压力数据发送。 */
+    usart_receive_config(USART0, USART_RECEIVE_ENABLE); /* 开启报警命令接收。 */
     usart_enable(USART0);
+    /* 同时开启外设接收中断源和 NVIC 中断入口，收到字节才会进入 ISR。
+       USART0 优先级 1，低于本工程优先级 0 的 SysTick。 */
+    usart_interrupt_enable(USART0, USART_INT_RBNE);
+    NVIC_SetPriority(USART0_IRQn, 1U);
+    NVIC_EnableIRQ(USART0_IRQn);
 }
 
-/* 固定文档协议：10 字节头 + 128 字节点值 + 16 字节保留零 + 1 字节 CRC8。
-   frame 已由 main.c 缩放为 0～255；序号与扫描帧数独立。 */
-void serial_send_frame(const uint16_t frame[MATRIX_ROWS][MATRIX_COLS], uint16_t sequence)
+/* 上行帧布局与点序见 serial.h。frame 由 main.c 缩放为 0～255。
+   只有 USART0 的最后一个停止位发出后才返回成功。 */
+uint8_t serial_send_frame(const uint16_t frame[MATRIX_ROWS][MATRIX_COLS], uint16_t sequence)
 {
     uint8_t row;
     uint8_t col;
@@ -55,14 +326,17 @@ void serial_send_frame(const uint16_t frame[MATRIX_ROWS][MATRIX_COLS], uint16_t 
     uint16_t value;
     uint8_t temporary;
 
+    /* 偏移 0～5：固定帧头与协议字节；不是接收端的报警命令。 */
     g_serial_tx_packet[0] = 0x5AU;
     g_serial_tx_packet[1] = 0xA5U;
     g_serial_tx_packet[2] = 0x01U;
     g_serial_tx_packet[3] = 0x10U;
     g_serial_tx_packet[4] = 0x03U;
     g_serial_tx_packet[5] = 0x02U;
+    /* 偏移 6～7：16 位流水号，大端发送，即高字节在前。 */
     g_serial_tx_packet[6] = (uint8_t)(sequence >> 8);
     g_serial_tx_packet[7] = (uint8_t)sequence;
+    /* 偏移 8～9：00 9B，与固定总帧长 155 对应。 */
     g_serial_tx_packet[8] = 0x00U;
     g_serial_tx_packet[9] = 0x9BU;
 
@@ -102,6 +376,8 @@ void serial_send_frame(const uint16_t frame[MATRIX_ROWS][MATRIX_COLS], uint16_t 
             g_serial_tx_packet[i + MATRIX_COLS - 1U - col] = temporary;
         }
     }
+    /* 上述重排后的最终点序：行 Y7～Y0、Y15～Y8，每行列 HC7～HC0。
+       有效 ADC 值在 main.c 右移 4 位；超时点编码 00，与有效零值无法区分。 */
     /* 偏移 138～153 为保留区，全零，不存放超时位图。 */
     for(i = 138U; i < 154U; ++i) {
         g_serial_tx_packet[i] = 0U;
@@ -114,6 +390,21 @@ void serial_send_frame(const uint16_t frame[MATRIX_ROWS][MATRIX_COLS], uint16_t 
 
     /* 仅发送这 155 个二进制字节，不添加文本、换行或终止符。 */
     for(i = 0U; i < SERIAL_MATRIX_FRAME_LEN; ++i) {
-        send_byte(g_serial_tx_packet[i]);
+        while(RESET == usart_flag_get(USART0, USART_FLAG_TBE)) {
+            if(!power_supply_ok()) {
+                return 0U;
+            }
+        }
+        if(!power_supply_ok()) {
+            return 0U;
+        }
+        usart_data_transmit(USART0, g_serial_tx_packet[i]);
     }
+    /* 等最后一个停止位发出后才推进流水号。 */
+    while(RESET == usart_flag_get(USART0, USART_FLAG_TC)) {
+        if(!power_supply_ok()) {
+            return 0U;
+        }
+    }
+    return 1U;
 }

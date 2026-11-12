@@ -57,7 +57,7 @@ void systick_config(void)
     NVIC_SetPriority(SysTick_IRQn, 0x00U);
 }
 
-uint32_t systick_millis(void)
+uint32_t systick_millis(void)//毫秒计数
 {
     return ticks;
 }

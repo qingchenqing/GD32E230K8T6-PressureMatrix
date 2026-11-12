@@ -1,4 +1,5 @@
-#include "matrix.h"
+﻿#include "matrix.h"
+#include "power.h"
 #include "gd32e23x.h"
 #include "systick.h"
 
@@ -81,6 +82,9 @@ static void adc_input_init(void)
                   GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 |
                   GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7);
 
+    /* PB1/ADC_IN9 采样外部 5 V 的分压，与压力列共用 ADC。 */
+    gpio_mode_set(GPIOB, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO_PIN_1);
+
     rcu_periph_clock_enable(RCU_ADC);
     rcu_adc_clock_config(RCU_ADCCK_APB2_DIV6); /* 72 MHz 主频 / 6 = 12 MHz ADC 时钟 */
     adc_deinit();
@@ -132,21 +136,57 @@ void matrix_init(void)
 }
 
 /* 扫描顺序为 ROW1/COL1 → ROW16/COL8，结果按 frame[row][col] 保存。 */
-void matrix_scan_frame(uint16_t frame[MATRIX_ROWS][MATRIX_COLS])
+uint8_t matrix_scan_frame(uint16_t frame[MATRIX_ROWS][MATRIX_COLS])
 {
     uint8_t row; /* 当前行下标：0～15 */
     uint8_t col; /* 当前列下标：0～7 */
 
-    for(row = 0U; row < MATRIX_ROWS; ++row) {
+    for(row = 0U; row < MATRIX_ROWS && power_supply_ok(); ++row) {//行
 //        shift_595(0U);
 //        delay_1ms(ROW_RELEASE_MS); /* 所有行关闭，给压力膜和放大器放电 */
         shift_595((uint16_t)(1U << row_bit_position[row]));
         delay_1ms(ROW_SETTLE_MS); /* 目标行选通后等待压力膜、放大器和 ADC 稳定 */
-        for(col = 0U; col < MATRIX_COLS; ++col) {
-            frame[row][col] = sample_column(column_adc_channel[col]);
+        for(col = 0U; col < MATRIX_COLS; ++col) {//列
+            if(!power_supply_ok()) {
+                shift_595(0U);
+                return 0U;
+            }
+            frame[row][col] = sample_column(column_adc_channel[col]);//把结果存到当前行、当前列的位置。
         }
     }
     shift_595(0U); /* 两帧之间不选通任何行 */
+    return (row == MATRIX_ROWS);
+}
+
+void matrix_adc_set_enabled(uint8_t enabled)
+{
+    if(enabled) {
+        rcu_periph_clock_enable(RCU_ADC);
+        adc_enable();
+    } else {
+        adc_disable();
+        rcu_periph_clock_disable(RCU_ADC);
+    }
+}
+
+void matrix_suspend(void)
+{
+    /* 锁存全零后关 OE# 输出，保证断电期间所有行关闭。 */
+    shift_595(0U);
+    gpio_bit_set(GPIOA, PIN_595_EN);
+    matrix_adc_set_enabled(0U);
+}
+
+void matrix_resume(void)
+{
+    /* 恢复已锁存的全零输出，下一帧重新从第一行开始。 */
+    gpio_bit_reset(GPIOA, PIN_595_EN);
+}
+
+/* 在矩阵扫描之外读取，避免与压力列切换 ADC 通道时互相干扰。 */
+uint16_t matrix_read_power_adc(void)
+{
+    return sample_column(ADC_CHANNEL_9);
 }
 
 /* 给主循环提供可观察的累计超时次数。 */

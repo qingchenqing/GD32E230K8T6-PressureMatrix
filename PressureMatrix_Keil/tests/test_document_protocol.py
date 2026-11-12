@@ -33,7 +33,7 @@ def emulator():
     cpu.mem_map(0x08000000, 0x10000)
     cpu.mem_map(0x20000000, 0x2000)
     cpu.mem_map(0x40013000, 0x1000)
-    cpu.mem_write(0x4001381C, struct.pack('<I', 0x80))  # USART TBE ready
+    cpu.mem_write(0x4001381C, struct.pack('<I', 0xC0))  # USART TBE and TC ready
     with (ROOT / 'Keil/output/PressureMatrix.axf').open('rb') as stream:
         elf = ELFFile(stream)
         symbols = {s.name: s['st_value'] for s in
@@ -58,6 +58,12 @@ def send_frame(values, sequence):
         if address == 0x40013828:  # Actual USART0 TDATA register write
             packet.append(value & 255)
 
+    def powered(uc, address, size, user_data):
+        uc.reg_write(UC_ARM_REG_R0, 1)
+        uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
+
+    check = symbols['power_supply_ok'] & ~1
+    cpu.hook_add(UC_HOOK_CODE, powered, begin=check, end=check)
     cpu.hook_add(UC_HOOK_MEM_WRITE, capture)
     cpu.emu_start(symbols['serial_send_frame'], 0x0800F000, count=200000)
     if cpu.reg_read(UC_ARM_REG_PC) != 0x0800F000:
@@ -153,28 +159,33 @@ class DocumentProtocolTests(unittest.TestCase):
 
     def test_main_sequences_count_packets_instead_of_scans(self):
         cpu, symbols = emulator()
-        skip = {symbols[name] & ~1 for name in
-                ('power_led_on', 'systick_config', 'matrix_init', 'serial_init',
-                 'matrix_scan_frame', 'matrix_adc_error_count')}
+        skip = {symbols[name] & ~1: 0 for name in
+                ('watchdog_init', 'systick_config', 'matrix_init', 'serial_init',
+                 'serial_startup_beep', 'delay_1ms', 'matrix_adc_error_count',
+                 'fwdgt_counter_reload')}
+        for name in ('power_supply_ok', 'matrix_scan_frame'):
+            skip[symbols[name] & ~1] = 1
         packet = bytearray()
         clock_calls = 0
 
         def capture(uc, address, size, user_data):
             nonlocal clock_calls
             if address in skip:
-                uc.reg_write(UC_ARM_REG_R0, 0)
+                uc.reg_write(UC_ARM_REG_R0, skip[address])
                 uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
             elif address == (symbols['systick_millis'] & ~1):
                 uc.reg_write(UC_ARM_REG_R0, clock_calls * 50)
                 clock_calls += 1
                 uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
-            elif address == (symbols['send_byte'] & ~1):
-                packet.append(uc.reg_read(UC_ARM_REG_R0) & 255)
-                uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
+
+        def capture_tx(uc, access, address, size, value, user_data):
+            if address == 0x40013828:
+                packet.append(value & 255)
                 if len(packet) == 465:
                     uc.emu_stop()
 
         cpu.hook_add(UC_HOOK_CODE, capture)
+        cpu.hook_add(UC_HOOK_MEM_WRITE, capture_tx)
         cpu.emu_start(symbols['main'], 0x0800F000, count=1000000)
         self.assertEqual(bytes(packet), b''.join(
             expected_packet([0] * 128, seq) for seq in range(3)))
